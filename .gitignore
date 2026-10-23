@@ -1,0 +1,8 @@
+venv/
+.venv/
+__pycache__/
+*.db
+.env
+sql_db/queries.sql
+nb.ipynb
+*.csv
