@@ -22,7 +22,8 @@ engine = create_engine(connection_string)
 
 # %% [markdown]
 # # SEASONAL NAIVE FORECASTER
-# This performs a year-over-year comparison to establish a baseline RMSE performance that I can then gauge my other models by. 2017 is my current YTD up to August 15. I am using a window on 2016 of the same range to serve as the predicted values. The project goal is to forecast the target 'sales' 15 days past YTD.
+# This performs a year-over-year comparison to establish a baseline RMSE performance that I can then gauge my other models by. 2017 is my current YTD up to August 15.
+# I am using a window on 2016 of the same range to serve as the predicted values. The project goal is to forecast the target 'sales' 15 days past YTD.
 
 # %%
 # how many records each year? 648648 in regular year, 650430 in leap year (eg 2016)
