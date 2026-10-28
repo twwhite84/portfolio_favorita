@@ -1,3 +1,8 @@
+# %% [markdown]
+# The dates in the test data are for the 15 days after the last date in the training data.
+# 
+# https://www.kaggle.com/competitions/store-sales-time-series-forecasting
+
 # %%
 import os
 from dotenv import load_dotenv
@@ -21,9 +26,7 @@ connection_string = f"mariadb+mariadbconnector://{DB_USER}:{DB_PASSWORD}@{DB_HOS
 engine = create_engine(connection_string)
 
 # %% [markdown]
-# # SEASONAL NAIVE FORECASTER
-# This performs a year-over-year comparison to establish a baseline RMSE performance that I can then gauge my other models by. 2017 is my current YTD up to August 15.
-# I am using a window on 2016 of the same range to serve as the predicted values. The project goal is to forecast the target 'sales' 15 days past YTD.
+# # DATA CHECK
 
 # %%
 # how many records each year? 648648 in regular year, 650430 in leap year (eg 2016)
@@ -185,27 +188,253 @@ pd.read_sql_query(q, con=engine)
 pd.read_sql_query(text("show index from train;"), con=engine)
 
 # %%
-# without an index the joining used to perform the lag will take forever, so add one
-with engine.begin() as con:
-    con.execute(text("create index idx_train_lookup on train (date, store_nbr, family);"))
+# without an index the joining used to perform the lag will take forever, so add one if it doesn't exist
+df_keys = pd.read_sql_query(text("show index from train;"), con=engine)['Key_name']
+if("idx_train_lookup" not in df_keys.values):
+    with engine.begin() as con:
+        con.execute(text("create index idx_train_lookup on train (date, store_nbr, family);"))
+
+# %% [markdown]
+# # NAIVE FORECASTER
+# This compares a 15-day validation window at the end of my training set against the day immediately preceding that window. Use of a fixed cutoff like this simulates how a multi-step (ie multiple period) forecast can accumulate error the further it reaches out.
 
 # %%
-# the rmse is 644.47, rmsle is 0.86
+# validation window boundaries
+pd.read_sql_query(text("""
+select 
+    max(`date`)-interval 15 day valid_start, 
+    max(`date`) valid_end
+from train
+;
+"""), con=engine)
+
+# %%
+# reference and validation sales columns
 q=text("""
-    select
-        t2017.date d,
-        t2017.sales,
-        t2016.sales sales_lag
-    from train t2017
-    join train t2016
-        on t2016.date = t2017.date - interval 1 year
-        and t2016.store_nbr = t2017.store_nbr
-        and t2016.family = t2017.family
-    where t2017.date >= '2017-01-01' and t2017.date <= '2017-08-15'
+select
+    t_ref.date date_ref,
+    t_valid.date date_valid,
+    t_ref.sales sales_ref,
+    t_valid.sales sales_valid    
+from train t_ref
+join train t_valid
+    on t_ref.date='2017-07-30'
+    and t_ref.store_nbr=t_valid.store_nbr
+    and t_ref.family=t_valid.family
+where t_valid.date >= '2017-07-31' and t_valid.date <= '2017-08-15'
+;
 """)
 df_naive = pd.read_sql_query(q, con=engine)
-rmse = root_mean_squared_error(df_naive['sales'], df_naive['sales_lag'])
-rmsle = root_mean_squared_log_error(df_naive['sales'], df_naive['sales_lag'])
-print(f"RMSE: {rmse}, RMSLE: {rmsle}")
+df_naive
+
+# %%
+rmse = root_mean_squared_error(df_naive['sales_valid'], df_naive['sales_ref'])
+print(f"RMSE: {round(rmse,2)}")
+
+# %% [markdown]
+# # SEASONAL NAIVE FORECASTER
+# This performs a day-aligned year-over-year comparison using a 15-day validation window at the end of my training set.
+
+# %%
+# lagging by 364 days aligns the days a year apart, not the dates, which matters because there are weekly cyclical patterns
+q=text("""
+    select
+        t_ref.date date_ref,
+        dayname(t_ref.date) day_ref,
+        t_valid.date date_valid,
+        dayname(t_valid.date) day_valid,    
+        t_ref.sales sales_ref,
+        t_valid.sales sales_valid
+    from train t_ref
+    join train t_valid
+        on t_ref.date = t_valid.date - interval 364 day
+        and t_ref.store_nbr = t_valid.store_nbr
+        and t_ref.family = t_valid.family
+    where t_valid.date >= '2017-07-31' and t_valid.date <= '2017-08-15'
+""")
+df_naive = pd.read_sql_query(q, con=engine)
+df_naive
+
+# %%
+rmse = root_mean_squared_error(df_naive['sales_valid'], df_naive['sales_ref'])
+print(f"RMSE: {round(rmse,2)}")
+
+# %% [markdown]
+# ## Comparing results vs statsforecast SeasonalNaive
+
+# %%
+from statsforecast import StatsForecast
+from statsforecast.models import SeasonalNaive
+from utilsforecast.preprocessing import fill_gaps
+
+# %%
+# validation set
+q=text("""
+with sq as (
+    select `date`, store_nbr, family, sales
+    from train t
+    where t.date >= '2017-07-31' and t.date <= '2017-08-15'
+)
+select
+    concat(store_nbr,'_',family) unique_id,
+    `date` ds,
+    sales y
+from sq
+""")
+df_valid = pd.read_sql_query(q, con=engine).convert_dtypes()
+df_valid['ds']=pd.to_datetime(df_valid['ds'])
+df_valid
+
+# %%
+# training set
+q=text("""
+with sq as (
+    select `date`, store_nbr, family, sales
+    from train t
+    where t.date < '2017-07-31'
+)
+select
+    concat(store_nbr,'_',family) unique_id,
+    `date` ds,
+    sales y
+from sq
+""")
+df_train = pd.read_sql_query(q, con=engine).convert_dtypes()
+df_train['ds']=pd.to_datetime(df_train['ds'])
+df_train
+
+# %%
+# is dec 25th missing from df_train? yes
+df_train.loc[(df_train['ds'].dt.month==12) & (df_train['ds'].dt.day==25)]
+
+# %%
+# add new records for any missing dates
+df_train = fill_gaps(df_train, freq='D', id_col='unique_id', time_col='ds')
+df_train['y'] = df_train['y'].fillna(0)
+
+# %%
+# fit the model
+fcast_naive = StatsForecast(
+    models=[SeasonalNaive(season_length=364)],
+    freq='D',
+    n_jobs=-1
+)
+fcast_naive.fit(df_train)
+
+# %%
+# predict the validation window
+df_naive = fcast_naive.predict(h=16, level=[90])
+df_naive
+
+# %%
+# compare y_preds vs y_actuals, RMSE is the same as doing it manually
+df_naive = pd.merge(df_naive, df_valid, on=['unique_id', 'ds'], how="inner")
+rmse = root_mean_squared_error(df_naive['y'], df_naive['SeasonalNaive'])
+print(f"RMSE: {round(rmse,2)}")
+
+# %% [markdown]
+# # SARIMAX
+# Use a 7-day season length to capture the dominant weekly cyclical pattern, bring in exogenous variables to inform the model of longer term trends, and train on a year's worth of data preceding the validation window.
+
+# %%
+from statsforecast.models import AutoARIMA
+
+# %%
+# validation set
+q=text("""
+with sq as (
+    select `date`, store_nbr, family, sales
+    from train t
+    where t.date >= '2017-07-31' and t.date <= '2017-08-15'
+)
+select
+    concat(store_nbr,'_',family) unique_id,
+    `date` ds,
+    sales y
+from sq
+""")
+df_valid = pd.read_sql_query(q, con=engine).convert_dtypes()
+df_valid['ds']=pd.to_datetime(df_valid['ds'])
+df_valid
+
+# %%
+# training set spanning one year with exogenous variable (temp set to 6 month for testing purposes)
+q=text("""
+with sq as (
+    select `date`, store_nbr, family, sales, onpromotion
+    from train t
+    where t.date >= ('2017-07-30'-interval 1 year) and t.date <= '2017-07-30'
+)
+select
+    concat(store_nbr,'_',family) unique_id,
+    `date` ds,
+    sales y,
+    onpromotion
+from sq
+""")
+df_train = pd.read_sql_query(q, con=engine).convert_dtypes()
+df_train['ds']=pd.to_datetime(df_train['ds'])
+df_train
+
+# %%
+# is dec 25th missing from df_train? yes
+df_train.loc[(df_train['ds'].dt.month==12) & (df_train['ds'].dt.day==25)]
+
+# %%
+# on days with sales = 0, what is the onpromotion value? by far the most common value is also 0
+q=text("""
+    select 
+        onpromotion,
+        count(onpromotion) n
+    from train
+    where sales=0
+    group by onpromotion
+;
+""")
+pd.read_sql_query(q, con=engine)
+
+# %%
+# add new records for any missing dates
+df_train = fill_gaps(df_train, freq='D', id_col='unique_id', time_col='ds')
+df_train['y'] = df_train['y'].fillna(0)
+df_train['onpromotion'] = df_train['onpromotion'].fillna(0)
+df_train.loc[df_train['ds']=='2016-12-25']
+
+# %%
+# I need future exogenous values covering my future/validation window
+q=text("""
+with sq as (
+    select `date`, store_nbr, family, onpromotion
+    from train t
+    where t.date >= '2017-07-31' and t.date <= '2017-08-15'
+)
+select
+    concat(store_nbr,'_',family) unique_id,
+    `date` ds,
+    onpromotion
+from sq
+""")
+df_Xvalid = pd.read_sql_query(q, con=engine).convert_dtypes()
+df_Xvalid['ds']=pd.to_datetime(df_Xvalid['ds'])
+df_Xvalid
+
+# %%
+# instantiate and fit
+fcast_sarima = StatsForecast(
+    models=[AutoARIMA(season_length=7)],
+    freq='D',
+    n_jobs=-1
+)
+fcast_sarima.fit(df_train)
+
+# %%
+# predict
+df_sarima = fcast_sarima.predict(h=16, level=[90], X_df=df_Xvalid)
+df_sarima = pd.merge(df_sarima, df_valid, on=['unique_id', 'ds'], how="inner")
+df_sarima
+
+# %%
+# compared against actuals, RMSE is better than a seasonal naive
+root_mean_squared_error(df_sarima['y'], df_sarima['AutoARIMA'])
 
 
